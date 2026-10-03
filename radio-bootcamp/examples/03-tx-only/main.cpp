@@ -17,7 +17,7 @@ void setup() {
     analogReadResolution(10);
     delay(400);
 
-    // Same band detection as the 2026 ground station.
+    // Band read
     bool is900 = analogRead(FREQ_PIN) > 350;
     float frequency = is900 ? 914.50f : 433.00f;
     radio = is900 ? static_cast<SX126x *>(&radio900)

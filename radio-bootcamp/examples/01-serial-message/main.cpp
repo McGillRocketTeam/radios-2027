@@ -1,7 +1,10 @@
+// Basic structure of main.cpp
 #include <Arduino.h>
 #include "config.h"
 
+
 void setup() {
+    
     Serial.begin(GS_SERIAL_BAUD_RATE);
 }
 
