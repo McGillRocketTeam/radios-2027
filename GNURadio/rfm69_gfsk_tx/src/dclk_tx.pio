@@ -1,0 +1,44 @@
+; dclk_tx.pio - feed NRZ data to the RFM69 in continuous mode.
+;
+; In continuous TX mode the RFM69 drives its bit clock out on DIO1 (DCLK)
+; and samples DIO2 (DATA) on every rising DCLK edge. So we change DATA just
+; after each falling edge, which gives half a bit period of setup and hold.
+;
+;   IN base  = DCLK (DIO1)
+;   OUT base = DATA (DIO2)
+;   autopull at 32 bits, shift left -> bits go out MSB first.
+;
+; If the TX FIFO runs dry, `out` stalls and DATA holds its last value, so the
+; radio keeps transmitting (you'd see a tone in the spectrum, not a dropout).
+
+.program dclk_tx
+.wrap_target
+    wait 0 pin 0        ; DCLK low
+    out pins, 1         ; present next bit
+    wait 1 pin 0        ; radio samples it on this rising edge
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+;this gets the wrap_target address then assign variable
+static inline void dclk_tx_program_init(PIO pio, uint sm, uint offset,
+                                        uint dclk_pin, uint data_pin) {
+    pio_sm_config c = dclk_tx_program_get_default_config(offset);
+    
+
+    sm_config_set_in_pins(&c, dclk_pin);
+    sm_config_set_out_pins(&c, data_pin, 1);
+    sm_config_set_out_shift(&c, false, true, 32);   // shift left, autopull, 32 bits
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);  // 8-word TX FIFO
+
+    pio_gpio_init(pio, data_pin);
+    pio_gpio_init(pio, dclk_pin);
+    gpio_pull_down(dclk_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, dclk_pin, 1, false);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
