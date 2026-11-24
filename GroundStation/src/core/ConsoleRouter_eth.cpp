@@ -1,0 +1,611 @@
+#include "ConsoleRouter.h"
+
+#ifdef GS_ETHERNET_ENABLE
+#include "Config.h"
+#include "CommandLine.h"
+#include "CommandParser.h"
+#include "GroundCommand.h"
+#include "GroundStationStore.h"
+#include "MqttTopics.h"
+#include "ParamStore.h"
+#include "PinLayout.h"
+#include "RocketCommand.h"
+
+#include <EthernetConfig.h>
+#include <PubSubClient.h>
+
+#include <QNEthernet.h>
+using namespace qindesign::network;
+
+// === Global accesors ===
+static EthernetClient ethClient;
+static PubSubClient mqttClient(ethClient);
+static ConsoleRouter *s_router = nullptr;
+
+// === Static global function forward decleration ===
+
+static bool ethernetUp();
+static bool mqttUp();
+
+// ISR flag for polling ethernet reconnect (start true to force initial connection attempt)
+volatile bool ethernetReconnectNeeded = true;
+
+volatile bool mqttCmdReady = false;
+volatile command_line mqttCmdLine = {0};
+
+namespace
+{
+    static void onMqttMessage(char *topic, uint8_t *payload, unsigned int length)
+    {
+        (void)topic;
+
+        // If you truly need router check, keep it; otherwise remove for speed.
+        ConsoleRouter *r = s_router;
+        if (!r)
+            return;
+
+        // Drop if previous command not yet consumed
+        if (mqttCmdReady)
+            return;
+
+        const uint8_t maxPayload = (uint8_t)(MAX_COMMAND_LENGTH - 1);
+        uint8_t n = (length < maxPayload) ? (uint8_t)length : maxPayload;
+
+        memcpy((void *)mqttCmdLine.buf, payload, n);
+        mqttCmdLine.buf[n] = '\0';
+        mqttCmdLine.len = n;
+
+        // Publish last
+        mqttCmdReady = true;
+    }
+}
+
+// === Setup ===
+
+void ConsoleRouter::begin(MqttTopic::Role role, CommandParser &parser)
+{
+    Serial.begin(GS_SERIAL_BAUD_RATE);
+
+    // This is a local anonymous variable that helps the ethernet CB access this object
+    s_router = this;
+    commandParser = &parser;
+
+    applyRoleConfig(role);
+
+    // Init the eth stack with in built MAC and try dhcp
+    Ethernet.begin();
+
+    // This ISR will work with the reconnect function
+    // to reconnect the ethernet connection if it fails
+    ethernetTimer.begin(ethernetCheckISR, ETHERNET_RECONNECT_INTERVAL);
+    mqttClient.setCallback(onMqttMessage);
+
+    if (!Ethernet.waitForLocalIP(5000))
+    {
+        Serial.println("DHCP failed");
+    }
+    handleConsoleReconnect();
+}
+
+// === Main functions  ===
+void ConsoleRouter::handleConsoleReconnect()
+{
+    Ethernet.loop();
+
+    if (!ethernetReconnectNeeded)
+        return;
+
+    ethernetReconnectNeeded = false;
+
+    // If the cable is not plugged in do not attempt the blocking dhcp timeout
+    if (!ethernetUp())
+    {
+        Serial.println("Ethernet link still DOWN: waiting for cable");
+        return;
+    }
+
+    if (!mqttUp())
+    {
+        mqttReconnect();
+    }
+}
+
+void ConsoleRouter::mqttLoop()
+{
+    Ethernet.loop();
+
+    if (!ethernetUp())
+    {
+        return;
+    }
+
+    if (mqttUp())
+    {
+        mqttClient.loop();
+        handleMqttCommand();
+    }
+}
+
+// === State Management ===
+bool ConsoleRouter::isReady()
+{
+    return s_router != nullptr;
+}
+
+void ConsoleRouter::ethernetCheckISR()
+{
+    ethernetReconnectNeeded = true;
+}
+
+ConsoleRouter &ConsoleRouter::getInstance()
+{
+    static ConsoleRouter instance;
+    return instance;
+}
+
+// === Stream API support ===
+int ConsoleRouter::available()
+{
+    // Only Serial is readable; MQTT is publish-only
+    return Serial.available();
+}
+
+int ConsoleRouter::read()
+{
+    if (Serial.available() > 0)
+        return Serial.read();
+    return -1;
+}
+
+int ConsoleRouter::peek()
+{
+    if (Serial.available() > 0)
+        return Serial.peek();
+    return -1;
+}
+
+size_t ConsoleRouter::write(uint8_t c)
+{
+    // Publish single byte to MQTT
+    if (ethernetUp() && mqttUp())
+    {
+        this->publish(debugTopic_, &c, 1);
+    }
+
+    return Serial.write(c);
+}
+
+size_t ConsoleRouter::write(const uint8_t *buffer, size_t size)
+{
+    Serial.write(buffer, size);
+
+    if (ethernetUp() && mqttUp())
+    {
+        this->publish(debugTopic_, buffer, (unsigned int)size);
+    }
+    return size;
+}
+
+// === Funcs for ground station ===
+void ConsoleRouter::sendTelemetry(const uint8_t *buffer, size_t size)
+{
+    if (ethernetUp() && mqttUp())
+    {
+        this->publish(rocketTelemetryTopic_, buffer, (unsigned int)size);
+    }
+}
+
+void ConsoleRouter::sendRadioTelemetry(const uint8_t *buffer, size_t size)
+{
+    if (ethernetUp() && mqttUp())
+    {
+        this->publish(radioTelemetryTopic_, buffer, (unsigned int)size);
+    }
+}
+
+void ConsoleRouter::sendStatusOk()
+{
+    if (!ethernetUp() || !mqttUp())
+        return;
+
+    static const uint8_t notEnabledStatusBuffer[] = "RECEIVE";
+    static const uint8_t enabledStatusBuffer[] = "OK";
+
+    // Status needs to be retained
+    if (GroundStationStore::canTxFromCTS()){
+        this->publishRetained(statusTopic_, enabledStatusBuffer, sizeof(enabledStatusBuffer) - 1);
+    }
+    else {
+        this->publishRetained(statusTopic_, notEnabledStatusBuffer, sizeof(notEnabledStatusBuffer) - 1);
+    }
+
+    Serial.println("mqtt status refresh");
+
+    char macStr[18];
+    uint8_t macRaw[6];
+    getMac(macRaw);
+
+    snprintf(macStr, sizeof(macStr),
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             (unsigned)macRaw[0], (unsigned)macRaw[1], (unsigned)macRaw[2],
+             (unsigned)macRaw[3], (unsigned)macRaw[4], (unsigned)macRaw[5]);
+
+    const char *bandStr = ParamStore::is435() ? FREQUENCY_435_STR : FREQUENCY_903_STR;
+    const char *name = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::NAME);
+
+    const RadioParams &param = ParamStore::getRadioParams();
+
+    char detailBuffer[256];
+    int n = snprintf(detailBuffer, sizeof(detailBuffer),
+                     "%s TxFromCTS:%s Band:%s FREQ:%.2f BW:%.2f SF:%d CR:%d PWR:%d MAC:%s ",
+                     GroundStationStore::canTxFromCTS() ? "true" : "false",
+                     name, bandStr,
+                     (double)param.freq, (double)param.bw,
+                     param.sf, param.cr, param.pow,
+                     macStr);
+
+    size_t len = 0;
+    if (n > 0)
+    {
+        len = (n >= (int)sizeof(detailBuffer)) ? (sizeof(detailBuffer) - 1) : (size_t)n;
+    }
+
+    this->publishRetained(detailTopic_, (const uint8_t *)detailBuffer, len);
+}
+
+void ConsoleRouter::sendStatusFailed()
+{
+    if (!ethernetUp() || !mqttUp())
+        return;
+
+    static const uint8_t statusBuffer[] = "FAILED";
+
+    // Status needs to be retained
+    this->publishRetained(statusTopic_, statusBuffer, sizeof(statusBuffer) - 1);
+}
+
+void ConsoleRouter::sendCmdAckRx(uint8_t cmd_id, bool success)
+{
+    if (success)
+    {
+        publishAck("RX_OK", cmd_id);
+    }
+    else
+    {
+        publishAck("RX_NOK", cmd_id);
+    }
+}
+
+void ConsoleRouter::sendCmdAckTx(uint8_t cmd_id, bool success)
+{
+    if (success)
+    {
+        publishAck("TX_OK", cmd_id);
+    }
+    else
+    {
+        publishAck("TX_NOK", cmd_id);
+    }
+}
+
+void ConsoleRouter::sendRadioCmdAck()
+{
+    uint8_t jsonBuffer[64];
+
+    // status is a string -> must be JSON-escaped if it can contain quotes/newlines/backslashes.
+    int n = snprintf((char *)jsonBuffer,
+                     sizeof(jsonBuffer),
+                     "{\"status\":\"ACK_OK\"}");
+
+    if (n <= 0 || (size_t)n >= sizeof(jsonBuffer))
+        return;
+
+    this->publish(ackTopic_, jsonBuffer, (size_t)n);
+}
+
+void ConsoleRouter::sendFallbackError(const char *msg, size_t n)
+{
+    // Reinterpret case the goat
+    this->publish(MqttTopic::FALLBACK_ERROR_TOPIC, reinterpret_cast<const uint8_t *>(msg), n);
+    sendStatusFailed();
+}
+
+// == Getters Setters ==
+void ConsoleRouter::getMac(uint8_t mac[6])
+{
+    if (!mac)
+        return;
+    Ethernet.macAddress(mac);
+}
+
+// === Local accesable helper functions ===
+
+static bool ethernetUp()
+{
+    return Ethernet.linkStatus() == LinkON;
+}
+
+static bool mqttUp()
+{
+    return mqttClient.connected();
+}
+
+// === Internal helper functions ===
+
+void ConsoleRouter::applyRoleConfig(MqttTopic::Role role)
+{
+    // Configure identity based on band and role from frequency, then set the topics
+    if (ParamStore::is903())
+    {
+        band_ = MqttTopic::Band::B;
+        role_ = role;
+    }
+    else
+    {
+        band_ = MqttTopic::Band::A;
+        role_ = role;
+    }
+
+    setupHostName(role);
+
+    rocketTelemetryTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::FC_TELEMETRY);
+    ackTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::ACKS);
+    commandTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::COMMANDS);
+
+    radioTelemetryTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::RADIO_TELEMETRY);
+    statusTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::STATUS);
+    detailTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::DETAIL);
+    debugTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::DEBUG);
+    radioCommandTopic_ = MqttTopic::topic(role_, band_, MqttTopic::TopicKind::RADIO_COMMANDS);
+}
+
+void ConsoleRouter::setupHostName(MqttTopic::Role role)
+{
+    const char *baseName = MqttTopic::topic(role, band_, MqttTopic::TopicKind::NAME);
+
+    uint8_t mac[6];
+    getMac(mac);
+
+    // Use only last 3 bytes to keep hostname shorter
+    snprintf(
+        deviceNameBuf_,
+        sizeof(deviceNameBuf_),
+        "%s-%02X%02X%02X",
+        baseName,
+        mac[3], mac[4], mac[5]);
+
+    Ethernet.setHostname(deviceName_);
+}
+
+// == Centralised publish stuff ==
+void ConsoleRouter::publish(const char *topic, const uint8_t *payload, unsigned int length)
+{
+    bool ok = mqttClient.publish(topic, payload, length);
+    if (!ok)
+    {
+        Serial.println("Publish to mqtt failed");
+    }
+}
+
+void ConsoleRouter::publishRetained(const char *topic, const uint8_t *payload, unsigned int length)
+{
+    bool ok = mqttClient.publish(topic, payload, length, true);
+    if (!ok)
+    {
+        Serial.println("Publish to mqtt failed");
+    }
+}
+
+// == Handling logic for processing a command from mqtt ==
+
+void ConsoleRouter::handleMqttCommand()
+{
+    if (!takeMqttCmdLine())
+        return;
+
+    if (GroundCommand::isRocketCommand(currentCommandLine))
+    {
+        // A full rocket queue means we need to discard and send TX NOT OK
+        if (commandParser->isRocketQueueFull())
+        {
+            command_packet_extended cmd = {};
+            commandParser->getNextRocketCommand(cmd);
+            sendCmdAckTx(cmd.data.base.data.command_id, false);
+        }
+        // If we dont have enable from CTS rocket commands are ignored
+        else if (!GroundStationStore::canTxFromCTS())
+        {
+            this->println("Ignoring rocket command, no cts enabled");
+            return;
+        }
+    }
+
+    commandParser->enqueueCommand(currentCommandLine);
+    // Only send acks for rocket commands
+    uint8_t id;
+    if (RocketCommand::tryParseCommandId(currentCommandLine, id))
+    {
+        sendCmdAckRx(id, true);
+    }
+    // COULD figure out a way to tell the GSC received is invalid
+}
+
+// == Check on mqttCommandLine and copy into local if exists ==
+bool ConsoleRouter::takeMqttCmdLine()
+{
+    // Cant consume commands without a parser
+    if (!commandParser)
+        return false;
+
+    bool has = false;
+    noInterrupts();
+    if (mqttCmdReady)
+    {
+        // Copy whole struct
+        memcpy(&currentCommandLine, (const void *)&mqttCmdLine, sizeof(command_line));
+
+        if (currentCommandLine.len >= MAX_COMMAND_LENGTH)
+        {
+            currentCommandLine.len = MAX_COMMAND_LENGTH - 1;
+        }
+        currentCommandLine.buf[currentCommandLine.len] = '\0';
+
+        mqttCmdReady = false;
+        has = true;
+    }
+    interrupts();
+
+    return has;
+}
+
+void ConsoleRouter::publishAck(const char *status, uint8_t cmdId)
+{
+    if (!ethernetUp() || !mqttUp())
+        return;
+
+    uint8_t jsonBuffer[128];
+
+    // status is a string -> must be JSON-escaped if it can contain quotes/newlines/backslashes.
+    int n = snprintf((char *)jsonBuffer, sizeof(jsonBuffer),
+                     "{\"cmd_id\":%u,\"status\":\"%s\"}",
+                     (unsigned)cmdId, status);
+
+    if (n <= 0 || (size_t)n >= sizeof(jsonBuffer))
+        return;
+
+    this->publish(ackTopic_, jsonBuffer, (size_t)n);
+}
+
+// == Reconnect and resend status to mqtt ==
+bool ConsoleRouter::mqttReconnect()
+{
+
+    IPAddress brokerIp;
+    Serial.print("Resolving MQTT broker host: ");
+    Serial.println(BROKER_HOST);
+
+    bool ok = Ethernet.hostByName(BROKER_HOST, brokerIp);
+    if (!ok || brokerIp == INADDR_NONE)
+    {
+        Serial.println("DNS lookup failed for broker host");
+        return false;
+    }
+
+    Serial.print("MQTT broker ip resolved to ");
+    Serial.println(brokerIp);
+
+    mqttClient.setServer(brokerIp, SERVER_PORT);
+
+    if (mqttClient.connect(deviceName_, "", "", statusTopic_, 0, true, MQTT_LAST_WILL))
+    {
+        Serial.print("MQTT connected success");
+
+        sendStatusOk();
+        mqttClient.subscribe(commandTopic_, 1);
+        mqttClient.subscribe(radioCommandTopic_, 1);
+
+        return true;
+    }
+
+    Serial.print("MQTT connection failed");
+    return false;
+}
+
+// === Wrappers to support varios type templated prints ===
+
+// = Core print to mqtt and serial
+void ConsoleRouter::_publishBytes(const uint8_t *data, size_t len)
+{
+    if (ethernetUp() && mqttUp() && data && len)
+    {
+        this->publish(debugTopic_, data, (unsigned int)len);
+    }
+}
+
+void ConsoleRouter::_printString(const String &s, bool newline)
+{
+    if (!newline)
+    {
+        Serial.print(s);
+        _publishBytes(reinterpret_cast<const uint8_t *>(s.c_str()), s.length());
+    }
+    else
+    {
+        Serial.println(s);
+        _publishBytes(reinterpret_cast<const uint8_t *>(s.c_str()), s.length());
+    }
+}
+
+// - Const char* -
+void ConsoleRouter::print(const char *s)
+{
+    if (!s)
+        return;
+    Serial.print(s);
+    _publishBytes(reinterpret_cast<const uint8_t *>(s), strlen(s));
+}
+void ConsoleRouter::println(const char *s)
+{
+    if (!s)
+    {
+        println();
+        return;
+    }
+    Serial.println(s);
+    _publishBytes(reinterpret_cast<const uint8_t *>(s), strlen(s));
+    // const char nl = '\n';
+    // _publishBytes(reinterpret_cast<const uint8_t *>(&nl), 1);
+}
+
+// - String -
+void ConsoleRouter::print(const String &s) { _printString(s, false); }
+void ConsoleRouter::println(const String &s) { _printString(s, true); }
+
+// - single char -
+void ConsoleRouter::print(char c)
+{
+    Serial.print(c);
+    _publishBytes(reinterpret_cast<const uint8_t *>(&c), 1);
+}
+void ConsoleRouter::println()
+{
+    Serial.println();
+    // Newline is useless for mqtt logs, could be enabled if GSC has terminal
+    // const char nl = '\n';
+    // _publishBytes(reinterpret_cast<const uint8_t *>(&nl), 1);
+}
+
+// - Support for flash strings -
+void ConsoleRouter::print(const __FlashStringHelper *fs)
+{
+    if (!fs)
+        return;
+    // Measure and copy from flash to RAM
+    const char *p = reinterpret_cast<const char *>(fs);
+    size_t n = strlen_P(p);
+    Serial.print(fs);
+    if (n == 0)
+        return;
+    // Small stack buffer for typical short literals; fallback to heap if large
+    if (n < 128)
+    {
+        char buf[128];
+        strncpy_P(buf, p, n);
+        _publishBytes(reinterpret_cast<const uint8_t *>(buf), n);
+    }
+    else
+    {
+        char *buf = (char *)malloc(n + 1);
+        if (!buf)
+            return;
+        strncpy_P(buf, p, n);
+        _publishBytes(reinterpret_cast<const uint8_t *>(buf), n);
+        free(buf);
+    }
+}
+void ConsoleRouter::println(const __FlashStringHelper *fs)
+{
+    print(fs);
+    println();
+}
+#endif

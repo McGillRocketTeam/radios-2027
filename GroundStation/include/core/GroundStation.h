@@ -1,0 +1,163 @@
+#pragma once
+
+#include <IntervalTimer.h>
+#include <memory>
+
+#include "CommandParser.h"
+#include "frame_view.h"
+#include "ParamStore.h"
+#include "RadioModule.h"
+
+/**
+ * @class GroundStation
+ * @brief Singleton class representing the central logic for the ground station.
+ *
+ * Manages radio communication, command parsing, packet processing, and parameter handling.
+ * Provides methods for asynchronous input handling and packet reception.
+ */
+class GroundStation
+{
+public:
+    // This is an injectable call back to overrid behaviour of verbose print
+    using PrintHook = void (*)(const FrameView&, ParseError, float, float);
+
+    /**
+     * @brief Get the singleton instance of the GroundStation.
+     * @return Pointer to the GroundStation instance.
+     */
+    static GroundStation &getInstance();
+
+    /**
+     * @brief Initialize the ground station subsystems.
+     */
+    void initialise(CommandParser &parser);
+
+    /**
+     * @brief Starts the command parser interrupt which raises a flag every 10ms.
+     *
+     * This sets up the timer to periodically set a flag. The actual parsing
+     * must be handled by calling handleCommandParserUpdate() inside the loop.
+     */
+    void startCommandParserSerial();
+
+    /**
+     * @brief Starts listening for radio packets asynchronously.
+     */
+    void startAsyncReceive();
+
+    /**
+     * @brief Checks the command parser flag and updates the command parser if needed.
+     *
+     * Should be called repeatedly in the main loop to process user input via Serial.
+     */
+    void handleCommandParserUpdate();
+
+    /**
+     * @brief Grabs the next available ground command and tries to do it.
+     */
+    void handleGroundCommand();
+
+    /**
+     * @brief Processes the most recently received radio packet.
+     */
+    void handleReceivedPacket();
+
+    /**
+     * @brief Handles the execution of the next available rocket command.
+     */
+    void handleRocketCommand();
+
+    /**
+     * @brief Prints queue status (radio/rocket) to Serial.
+     */
+    void getQueueStatus();
+
+    /**
+     * @brief Accessor for the radio module.
+     * @return Pointer to the radio module.
+     */
+    RadioModule *getRadioModule();
+
+    void setPrintHook(PrintHook hook);
+
+    void printVerboseTelemetryPacket();
+
+    /**
+     * @brief Destructor for GroundStation.
+     */
+    ~GroundStation() = default;
+
+    // Delete copy and move constructors and assignment operators to enforce singleton pattern
+    GroundStation(const GroundStation &) = delete;
+    GroundStation &operator=(const GroundStation &) = delete;
+    GroundStation(GroundStation &&) = delete;
+    GroundStation &operator=(GroundStation &&) = delete;
+
+private:
+    /**
+     * @brief Private constructor for singleton pattern.
+     */
+    GroundStation();
+
+
+    /**
+     * @brief Serialises string and sendes the serialised rocket command
+     * @param command The command to send.
+     */
+    void sendRocketCommand(command_packet_extended &command);
+
+    void sendTelemetryToGui();
+
+    // Reads the received packet into the the currentFrameView and validates it
+    void readReceivedPacketToFrame();
+
+    void implementGroundCommand(GroundCommand::Cmd command);
+
+    /**
+     * @brief Static ISR callback to raise the command parser flag.
+     */
+    static void raiseCommandParserFlag();
+
+    /**
+     * @brief Enables or disables verbose packet printing.
+     * @param state True to enable verbose printing.
+     */
+    void setVerbosePacket(bool state);
+
+    void clearRocketCommandQueue();
+
+    /// Pointer to the radio module
+    std::unique_ptr<RadioModule> radioModule;
+
+    /// Pointer to the command parser
+    CommandParser *commandParser;
+
+    /// Pointer to poential verbose print function override
+    PrintHook verbosePrintHook = nullptr;
+
+    // Frame view setup
+    //  Buffer that persists for the life of Ground Station
+    //  It will hold the actual bytes for the frame view
+    uint8_t rxBuf[512];
+    size_t rxLen = 0;
+    FrameView currentFrameView;
+    ParseError currentFrameState = ParseError::Ok;
+
+    /// RSSI and SNR snapshot of the last packet received
+    float lastRSSI = 0;
+    float lastSNR = 0;
+
+    /// Raw RSSI and SNR snapshot of last packet receive
+    uint8_t lastRawRSSI = 0;
+    int8_t lastRawSNR = 0;
+
+    /// Timer for raising the commandParserFlag every 10ms
+    IntervalTimer commandParserTimer;
+
+    /// Timer for reverting parameters after a timeout
+    IntervalTimer paramRevertTimer;
+
+    /// Flag raised by the timer interrupt to indicate it's time to update the parser
+    static volatile bool commandParserFlag;
+
+};

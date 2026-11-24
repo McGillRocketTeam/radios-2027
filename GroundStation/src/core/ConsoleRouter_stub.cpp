@@ -1,0 +1,102 @@
+#include "ConsoleRouter.h"
+#include "Config.h"
+#include "MqttTopics.h"
+
+#ifndef GS_ETHERNET_ENABLE
+
+void ConsoleRouter::begin(MqttTopic::Role role, CommandParser &parser)
+{
+    Serial.begin(GS_SERIAL_BAUD_RATE);
+    commandParser = &parser;
+}
+
+bool ConsoleRouter::isReady() { return true; }
+
+void ConsoleRouter::handleConsoleReconnect() { /* no-op */ }
+void ConsoleRouter::mqttLoop() { /* no-op */ }
+
+void ConsoleRouter::sendTelemetry(const uint8_t *, size_t) { /* no-op */ }
+void ConsoleRouter::sendRadioTelemetry(const uint8_t *, size_t) { /* no-op */ }
+void ConsoleRouter::sendStatusOk() { /* no-op */ }
+void ConsoleRouter::sendStatusFailed() { /* no-op */ }
+void ConsoleRouter::sendCmdAckRx(uint8_t, bool) { /* no-op */ }
+void ConsoleRouter::sendCmdAckTx(uint8_t, bool) { /* no-op */ }
+void ConsoleRouter::sendRadioCmdAck() { /* no-op */ }
+void ConsoleRouter::sendFallbackError(const char* msg,size_t n) { /* no-op */ }
+
+bool ConsoleRouter::mqttReconnect() { return false; }
+void ConsoleRouter::publishAck(const char *, uint8_t) { /* no-op */ }
+void ConsoleRouter::getMac(uint8_t mac[6] ){
+    // Can implement the hardware get here since we dont have the Ethernet object
+    for (int i = 0; i < 6; i++) mac[i] = 0;
+}
+
+ConsoleRouter &ConsoleRouter::getInstance()
+{
+    static ConsoleRouter instance;
+    return instance;
+}
+
+int ConsoleRouter::available() { return Serial.available(); }
+int ConsoleRouter::read() { return Serial.available() ? Serial.read() : -1; }
+int ConsoleRouter::peek() { return Serial.available() ? Serial.peek() : -1; }
+
+size_t ConsoleRouter::write(uint8_t c) { return Serial.write(c); }
+size_t ConsoleRouter::write(const uint8_t *buffer, size_t size)
+{
+    Serial.write(buffer, size);
+    return size;
+}
+
+void ConsoleRouter::_publishBytes(const uint8_t *, size_t) {}
+void ConsoleRouter::_printString(const String &s, bool newline)
+{
+    if (newline)
+        Serial.println(s);
+    else
+        Serial.print(s);
+}
+
+
+void ConsoleRouter::print(const char *s)
+{
+    if (!s)
+        return;
+    Serial.print(s);
+}
+void ConsoleRouter::println(const char *s)
+{
+    if (!s)
+    {
+        println();
+        return;
+    }
+    Serial.println(s);
+}
+
+// --- String ---
+void ConsoleRouter::print(const String &s) { _printString(s, false); }
+void ConsoleRouter::println(const String &s) { _printString(s, true); }
+
+// --- single char ---
+void ConsoleRouter::print(char c)
+{
+    Serial.print(c);
+}
+void ConsoleRouter::println()
+{
+    Serial.println();
+}
+
+void ConsoleRouter::print(const __FlashStringHelper *fs)
+{
+    if (!fs)
+        return;
+    Serial.print(fs);
+}
+void ConsoleRouter::println(const __FlashStringHelper *fs)
+{
+    Serial.println(fs);
+}
+
+#endif
