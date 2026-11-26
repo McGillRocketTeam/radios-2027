@@ -2,7 +2,8 @@
 // The radio is put in continuous mode then it clocks bits out on DIO1 (DCLK) and modulates whatever is on DIO2 (DATA)
 //
 // USB serial commands (115200, any terminal):
-//   p  PN9 PRBS                 r  random hardware range
+//   p  packets (see packet.h)   n  PN9 PRBS
+//   r  random hardware range
 //   a  1010... (shows +/-Fdev)  c  carrier all zeros
 //   t  transmit                 s  standby (stop TX)
 //   d  dump registers           
@@ -11,6 +12,7 @@
 
 #include "config.h"
 #include "rfm69.h"
+#include "packet.h"
 #include "dclk_tx.pio.h"   // generated from src/dclk_tx.pio, see README
 
 
@@ -33,7 +35,8 @@ static uint32_t next_word(void) {
     case 'r': return rp2040.hwrand32(); //fully random sequence
     case 'a': return 0xAAAAAAAAu; //0x1010101010
     case 'c': return 0x00000000u; //0x0000000000
-    case 'p':
+    case 'p': return packet_next_word(); //framed packets with 1010 idle between them
+    case 'n':
     default: { //PRBS 9 x^9 + x^5 + 1
         uint32_t w = 0;
         for (int i = 0; i < 32; i++) {
@@ -51,6 +54,7 @@ static const char *pattern_name(char p) { //just for output to serial monitor
     case 'r': return "random";
     case 'a': return "1010 alternating";
     case 'c': return "carrier (all zeros)";
+    case 'p': return "packets";
     default:  return "PN9";
     }
 }
@@ -61,6 +65,7 @@ static void led(bool on) {
 
 static void start_tx(void) { 
     pio_sm_clear_fifos(pio, sm); //look into this line
+    packet_reset(); //start packets from IDLE so the receiver gets 1 s of 1010 first
     while (!pio_sm_is_tx_fifo_full(pio, sm)) { pio_sm_put(pio, sm, next_word()); words_pushed++; }//loads the PIO fifo
     tx_on = rfm69_set_mode(OPMODE_TX);
     Serial.printf(tx_on ? "TX on\n" : "TX failed to start\n");
@@ -84,7 +89,8 @@ static void print_status(void) {
     Serial.printf("Power  %d dBm (%s)\n", RF_TX_POWER_DBM, RFM69_HIGH_POWER ? "PA1/PA2" : "PA0");
     Serial.printf("Data   %s, MSB first\n", pattern_name(pattern));
     Serial.printf("State  %s\n", tx_on ? "TRANSMITTING" : "standby");
-    Serial.printf("Keys: p r a c = pattern, t = TX, s = standby, d = dump regs, ? = this\n\n");
+    if (pattern == 'p') Serial.printf("Pkts   %lu sent\n", (unsigned long)packet_count());
+    Serial.printf("Keys: p n r a c = pattern, t = TX, s = standby, d = dump regs, ? = this\n\n");
 }
 
 void setup() {
@@ -133,7 +139,8 @@ void loop() {
     int ch = Serial.read();
     if (ch >= 0) {
         switch (ch) {
-        case 'p': case 'r': case 'a': case 'c':
+        case 'p': case 'n': case 'r': case 'a': case 'c':
+            if (ch == 'p' && pattern != 'p') packet_reset();
             pattern = (char)ch;
             Serial.printf("Pattern: %s\n", pattern_name(pattern));
             break;
@@ -154,6 +161,9 @@ void loop() {
             led(++blink & 1);
             Serial.printf("TX %s  measured DCLK ~%.0f bps%s\n", pattern_name(pattern), bps,
                           bps < 1.0 ? "  <-- no DCLK! check DIO1 wiring" : "");
+            if (pattern == 'p' && packet_count() > 0)
+                Serial.printf("   packets sent %lu, last seq %u\n",
+                              (unsigned long)packet_count(), packet_last_seq());
         }
     }
 }
